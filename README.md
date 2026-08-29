@@ -85,6 +85,7 @@ Two things people commonly get wrong, which this tool is careful about:
 
 ```bash
 brew tap HarsimarSingh23/claude-clean
+brew trust HarsimarSingh23/claude-clean   # Homebrew 6+ requires trusting third-party taps
 brew install claude-clean
 ```
 

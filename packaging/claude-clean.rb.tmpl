@@ -49,5 +49,14 @@ class ClaudeClean < Formula
     (testpath/"home/skills/lower/skill.md").write "---\nname: lower\ndescription: x\n---\n"
     out = shell_output("CLAUDE_HOME=#{testpath}/home NO_COLOR=1 #{bin}/claude-clean skills --list")
     assert_match "lower", out
+
+    # Regression: --list exited 1 when no skills.disabled directory existed,
+    # because a trailing `[ -d ... ] &&` test became the script's exit status.
+    # These assert on exit status, which shell_output alone would not catch.
+    with_env(CLAUDE_HOME: "#{testpath}/home", NO_COLOR: "1") do
+      system bin/"claude-clean", "skills", "--list"
+      system bin/"claude-clean", "audit"
+      system bin/"claude-clean", "skills", "--top", "5"
+    end
   end
 end
