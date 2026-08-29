@@ -1,17 +1,13 @@
-# Homebrew formula for claude-clean.
-#
-# Publish by pushing this repo to GitHub, tagging a release, then running
-# scripts/release.sh — it rewrites the url/sha256 below for you.
 class ClaudeClean < Formula
   desc "Audit and slim down Claude Code's startup context and on-disk state"
-  homepage "https://github.com/HarsimarSingh23/claude-clean"
-  url "https://github.com/HarsimarSingh23/claude-clean/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "0cc81ed0809ec21e419ddbe94e1d74d4fb86bb8c80de3cbfbec4acea9beb0d5e"
+  homepage "https://github.com/__REPO__"
+  url "https://github.com/__REPO__/archive/refs/tags/v__VERSION__.tar.gz"
+  sha256 "__SHA__"
   license "MIT"
-  head "https://github.com/HarsimarSingh23/claude-clean.git", branch: "main"
+  head "https://github.com/__REPO__.git", branch: "main"
 
-  # Pure bash + awk/sed/find, all present in the macOS base system. The optional
-  # `config` subcommand additionally uses python3, detected at runtime.
+  # Pure bash plus awk/sed/find from the base system. The optional `config`
+  # subcommand additionally uses python3, detected at runtime.
 
   def install
     bin.install "bin/claude-clean"
@@ -32,11 +28,11 @@ class ClaudeClean < Formula
     assert_match "claude-clean #{version}", shell_output("#{bin}/claude-clean --version")
     assert_match "USAGE", shell_output("#{bin}/claude-clean --help")
 
-    # Missing Claude Code install must fail loudly rather than silently.
+    # A missing Claude Code install must fail loudly rather than silently.
     out = shell_output("CLAUDE_HOME=#{testpath}/absent #{bin}/claude-clean audit 2>&1", 1)
     assert_match "no Claude Code directory", out
 
-    # Audit a synthetic install and confirm the skill is counted.
+    # Audit a synthetic install and confirm the skill is discovered.
     (testpath/"home/skills/demo").mkpath
     (testpath/"home/skills/demo/SKILL.md").write <<~SKILL
       ---
@@ -47,6 +43,11 @@ class ClaudeClean < Formula
     SKILL
     out = shell_output("CLAUDE_HOME=#{testpath}/home NO_COLOR=1 #{bin}/claude-clean audit")
     assert_match "active skills", out
-    assert_match "1", out
+
+    # Lowercase skill.md must be discovered too (case-insensitive filesystems).
+    (testpath/"home/skills/lower").mkpath
+    (testpath/"home/skills/lower/skill.md").write "---\nname: lower\ndescription: x\n---\n"
+    out = shell_output("CLAUDE_HOME=#{testpath}/home NO_COLOR=1 #{bin}/claude-clean skills --list")
+    assert_match "lower", out
   end
 end

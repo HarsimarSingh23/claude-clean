@@ -84,7 +84,7 @@ Two things people commonly get wrong, which this tool is careful about:
 ### Homebrew
 
 ```bash
-brew tap HarsimarSingh23/claude-clean https://github.com/HarsimarSingh23/claude-clean
+brew tap HarsimarSingh23/claude-clean
 brew install claude-clean
 ```
 
@@ -212,9 +212,20 @@ claude-clean skills --enable-all
 ## Development
 
 ```bash
-bash -n bin/claude-clean          # syntax check
-brew style Formula/claude-clean.rb # lint the formula
+bash -n bin/claude-clean   # syntax check
+shellcheck bin/claude-clean
 ```
+
+The Homebrew formula lives in a **separate tap repo**
+([HarsimarSingh23/homebrew-claude-clean](https://github.com/HarsimarSingh23/homebrew-claude-clean)),
+generated from [`packaging/claude-clean.rb.tmpl`](packaging/claude-clean.rb.tmpl).
+
+It is kept out of this repo on purpose. A formula stored inside the tarball it
+checksums is self-referential: editing the formula changes the tarball, which
+changes the `sha256`, which requires editing the formula. Related trap — GitHub
+caches release archives per tag name, so **moving or reusing a tag can serve a
+stale tarball** and break a published checksum. `release.sh` always cuts a fresh
+tag.
 
 Test against a synthetic install rather than your real one:
 
@@ -228,17 +239,17 @@ claude-clean audit
 ### Releasing
 
 ```bash
-scripts/release.sh 1.0.1 HarsimarSingh23/claude-clean
+scripts/release.sh 1.0.2
 ```
 
-Stamps the version into the script, builds `dist/claude-clean-<v>.tar.gz`, and
-rewrites the formula's `url` / `sha256` / `homepage`.
+Stamps the version, pushes, cuts a fresh tag and GitHub release, computes the
+tarball checksum, then renders and pushes the formula to the tap.
 
 ## Contributing
 
 Issues and PRs welcome. This is deliberately a single dependency-free bash
 script — please keep it that way. If you add a subcommand, add its assertions to
-the formula's `test do` block.
+the `test do` block in `packaging/claude-clean.rb.tmpl`.
 
 ## License
 
