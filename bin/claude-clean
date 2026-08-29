@@ -1,0 +1,743 @@
+#!/usr/bin/env bash
+#
+# claude-clean — audit and slim down Claude Code's startup context and on-disk state.
+#
+# Claude Code rebuilds its whole prompt every turn. Installed skills contribute
+# their name+description metadata to that prompt at startup, whether or not you
+# ever invoke them. This tool measures that overhead and lets you deactivate
+# skills reversibly (moved aside, never deleted), plus reclaim disk from caches
+# and transcripts.
+#
+# https://github.com/harsimarsingh/claude-clean
+
+set -uo pipefail
+
+VERSION="1.0.0"
+
+CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
+CLAUDE_CONFIG="${CLAUDE_CONFIG:-$HOME/.claude.json}"
+SKILLS_DIR="$CLAUDE_HOME/skills"
+DISABLED_DIR="$CLAUDE_HOME/skills.disabled"
+KEEP_FILE="$CLAUDE_HOME/claude-clean.keep"
+BACKUP_DIR="$CLAUDE_HOME/claude-clean-backups"
+
+DRY_RUN=0
+ASSUME_YES=0
+QUIET=0
+
+# ---------------------------------------------------------------- output ----
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[31m'; G=$'\033[32m'
+  Y=$'\033[33m'; C=$'\033[36m'; N=$'\033[0m'
+else
+  B=""; DIM=""; R=""; G=""; Y=""; C=""; N=""
+fi
+
+say()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+head1() { [ "$QUIET" -eq 1 ] || printf '\n%s%s%s\n' "$B" "$*" "$N"; }
+warn() { printf '%swarn:%s %s\n' "$Y" "$N" "$*" >&2; }
+err()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# Run a mutating command, or just describe it under --dry-run.
+run() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '%s  [dry-run] %s%s\n' "$DIM" "$*" "$N"
+    return 0
+  fi
+  "$@"
+}
+
+confirm() {
+  [ "$ASSUME_YES" -eq 1 ] && return 0
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  local reply
+  printf '%s [y/N] ' "$1" >&2
+  read -r reply </dev/tty 2>/dev/null || return 1
+  case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+}
+
+# Bytes -> human readable, without depending on GNU numfmt.
+human() {
+  awk -v b="${1:-0}" 'BEGIN{
+    split("B KB MB GB TB", u, " "); i=1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    printf (i==1 ? "%d %s\n" : "%.1f %s\n"), b, u[i]
+  }'
+}
+
+dir_bytes() {
+  [ -d "$1" ] || { echo 0; return; }
+  du -sk "$1" 2>/dev/null | awk '{print $1 * 1024}'
+}
+
+# ---------------------------------------------------------------- skills ----
+
+# Sum name/description frontmatter chars across every SKILL.md in a directory.
+# Handles YAML folded/wrapped descriptions by absorbing indented continuation
+# lines. Emits: "<name_chars> <desc_chars>"
+skill_frontmatter_chars() {
+  local dir="$1"
+  [ -d "$dir" ] || { echo "0 0"; return; }
+  find "$dir" -mindepth 2 -maxdepth 2 -iname SKILL.md -print0 2>/dev/null \
+    | xargs -0 -r awk '
+        FNR==1 { infm=0; started=0; indesc=0 }
+        /^---[[:space:]]*$/ {
+          if (!started) { started=1; infm=1; next }
+          else if (infm) { infm=0; indesc=0; next }
+        }
+        !infm { next }
+        /^name:/        { s=$0; sub(/^name:[[:space:]]*/,"",s);        nc+=length(s)+3; indesc=0; next }
+        /^description:/ { s=$0; sub(/^description:[[:space:]]*/,"",s); dc+=length(s);   indesc=1; next }
+        /^[[:space:]]/  { if (indesc) dc+=length($0); next }
+                        { indesc=0 }
+        END { printf "%d %d\n", nc+0, dc+0 }
+      ' 2>/dev/null \
+    | awk '{n+=$1; d+=$2} END{printf "%d %d\n", n+0, d+0}'
+}
+
+skill_count() {
+  [ -d "$1" ] || { echo 0; return; }
+  find "$1" -mindepth 2 -maxdepth 2 -iname SKILL.md 2>/dev/null | wc -l | tr -d ' '
+}
+
+est_tokens() { awk -v c="${1:-0}" 'BEGIN{printf "%d\n", int(c/4)}'; }
+
+# Skills the user has actually invoked, per ~/.claude.json skillUsage.
+used_skills() {
+  [ -f "$CLAUDE_CONFIG" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$CLAUDE_CONFIG" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+u = d.get("skillUsage") or {}
+if isinstance(u, dict):
+    for k in u:
+        print(str(k).split(":")[-1])
+elif isinstance(u, list):
+    for k in u:
+        if isinstance(k, str):
+            print(k.split(":")[-1])
+PY
+  fi
+}
+
+# The set of skills to preserve: actually-used + user keep-file + CLI --keep.
+build_keepset() {
+  local extra="${1:-}" strict="${2:-0}"
+  { [ "$strict" -eq 0 ] && used_skills
+    [ -f "$KEEP_FILE" ] && sed -e 's/#.*//' -e 's/[[:space:]]//g' "$KEEP_FILE"
+    [ -n "$extra" ] && printf '%s\n' "$extra" | tr ', ' '\n\n'
+  } 2>/dev/null | grep -v '^$' | sort -u
+}
+
+move_skill() {
+  local name="$1" from="$2" to="$3"
+  [ -d "$from/$name" ] || return 1
+  run mkdir -p "$to"
+  if [ -e "$to/$name" ]; then
+    warn "$name already exists in target; leaving in place"
+    return 1
+  fi
+  run mv "$from/$name" "$to/$name"
+}
+
+# ----------------------------------------------------------------- audit ----
+
+cmd_audit() {
+  local active_n disabled_n fm nc dc names_tok desc_tok total_tok
+
+  say "${B}claude-clean${N} ${DIM}v$VERSION${N}  —  ${DIM}$CLAUDE_HOME${N}"
+
+  head1 "Startup context (paid on every request)"
+
+  active_n=$(skill_count "$SKILLS_DIR")
+  disabled_n=$(skill_count "$DISABLED_DIR")
+  fm=$(skill_frontmatter_chars "$SKILLS_DIR")
+  nc=${fm%% *}; dc=${fm##* }
+  names_tok=$(est_tokens "$nc")
+  desc_tok=$(est_tokens "$dc")
+  total_tok=$(est_tokens "$((nc + dc))")
+
+  printf '  %-34s %s\n' "active skills" "${B}${active_n}${N}"
+  printf '  %-34s %s\n' "deactivated skills" "$disabled_n"
+  printf '  %-34s ~%s tokens\n' "  skill names" "$names_tok"
+  printf '  %-34s ~%s tokens\n' "  skill descriptions" "$desc_tok"
+
+  if [ "$total_tok" -gt 20000 ]; then
+    printf '  %-34s %s~%s tokens%s\n' "  metadata total" "$R" "$total_tok" "$N"
+  elif [ "$total_tok" -gt 5000 ]; then
+    printf '  %-34s %s~%s tokens%s\n' "  metadata total" "$Y" "$total_tok" "$N"
+  else
+    printf '  %-34s %s~%s tokens%s\n' "  metadata total" "$G" "$total_tok" "$N"
+  fi
+
+  # Percentage of a 200k window.
+  awk -v t="$total_tok" 'BEGIN{ printf "  %-34s %.1f%% of a 200k window\n", "  share of context", (t/200000)*100 }'
+
+  # CLAUDE.md memory files, which are also injected at startup.
+  local mem_bytes=0 f
+  for f in "$CLAUDE_HOME/CLAUDE.md" "./CLAUDE.md" "./.claude/CLAUDE.md"; do
+    [ -f "$f" ] && mem_bytes=$((mem_bytes + $(wc -c <"$f" | tr -d ' ')))
+  done
+  printf '  %-34s ~%s tokens\n' "CLAUDE.md memory" "$(est_tokens "$mem_bytes")"
+
+  # MCP servers contribute full tool schemas — often 1-3k tokens each.
+  local mcp_n=0
+  if command -v python3 >/dev/null 2>&1 && [ -f "$CLAUDE_CONFIG" ]; then
+    mcp_n=$(python3 - "$CLAUDE_CONFIG" <<'PY' 2>/dev/null || echo 0
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(0); sys.exit()
+n = len(d.get("mcpServers") or {})
+for p in (d.get("projects") or {}).values():
+    n += len(p.get("mcpServers") or {})
+print(n)
+PY
+)
+  fi
+  printf '  %-34s %s %s\n' "MCP servers configured" "$mcp_n" "${DIM}(~1-3k tokens of schema each)${N}"
+
+  head1 "Disk only (does NOT affect context)"
+
+  local p t s b tot=0 v
+  for pair in "projects:transcripts" "telemetry:telemetry" \
+              "shell-snapshots:shell snapshots" "backups:config backups" \
+              "session-env:session env" "tasks:tasks"; do
+    p="${pair%%:*}"; t="${pair##*:}"
+    v=$(dir_bytes "$CLAUDE_HOME/$p")
+    tot=$((tot + v))
+    [ "$v" -gt 0 ] && printf '  %-34s %s\n' "$t" "$(human "$v")"
+  done
+  [ -f "$CLAUDE_CONFIG" ] && {
+    v=$(wc -c <"$CLAUDE_CONFIG" | tr -d ' ')
+    tot=$((tot + v))
+    printf '  %-34s %s\n' "global config" "$(human "$v")"
+  }
+  printf '  %-34s %s%s%s\n' "total" "$B" "$(human "$tot")" "$N"
+
+  head1 "Suggested next steps"
+  if [ "$total_tok" -gt 20000 ]; then
+    local used_n; used_n=$(used_skills | sort -u | grep -cv '^$' || echo 0)
+    say "  ${R}▸${N} ${active_n} active skills cost ~${total_tok} tokens; you have invoked ${used_n}."
+    say "    ${C}claude-clean skills --keep-used --dry-run${N}   preview what would be deactivated"
+    say "    ${C}claude-clean skills --keep-used${N}             apply it (reversible)"
+  else
+    say "  ${G}▸${N} Skill metadata is in a healthy range."
+  fi
+  say "  ${C}claude-clean cache${N}                           reclaim telemetry/snapshot/backup disk"
+  say "  ${C}claude-clean transcripts --older-than 30${N}     prune old session transcripts"
+  say ""
+}
+
+# ---------------------------------------------------------------- skills ----
+
+cmd_skills() {
+  local mode="" match="" keep_extra="" top=20 strict=0 names=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --list)        mode="list" ;;
+      --top)         mode="top"; top="${2:-20}"; shift ;;
+      --keep-used)   mode="keep-used" ;;
+      --disable)     mode="disable"; shift; while [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; do names+=("$1"); shift; done; continue ;;
+      --enable)      mode="enable";  shift; while [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; do names+=("$1"); shift; done; continue ;;
+      --enable-all)  mode="enable-all" ;;
+      --match)       mode="match"; match="${2:-}"; shift ;;
+      --keep)        keep_extra="${2:-}"; shift ;;
+      --strict)      strict=1 ;;
+      *) die "unknown option for 'skills': $1" ;;
+    esac
+    shift
+  done
+
+  [ -n "$mode" ] || mode="list"
+
+  case "$mode" in
+    list)
+      say "${B}Active${N} ($(skill_count "$SKILLS_DIR")):"
+      [ -d "$SKILLS_DIR" ] && find "$SKILLS_DIR" -mindepth 2 -maxdepth 2 -iname SKILL.md 2>/dev/null \
+        | sed -e "s|^$SKILLS_DIR/||" -e 's|/[Ss][Kk][Ii][Ll][Ll]\.md$||' | sort | sed 's/^/  /'
+      say ""
+      say "${B}Deactivated${N} ($(skill_count "$DISABLED_DIR")):"
+      [ -d "$DISABLED_DIR" ] && find "$DISABLED_DIR" -mindepth 2 -maxdepth 2 -iname SKILL.md 2>/dev/null \
+        | sed -e "s|^$DISABLED_DIR/||" -e 's|/[Ss][Kk][Ii][Ll][Ll]\.md$||' | sort | sed 's/^/  /'
+      ;;
+
+    top)
+      say "${B}Heaviest skill descriptions${N} (top $top, by tokens):"
+      [ -d "$SKILLS_DIR" ] || return 0
+      find "$SKILLS_DIR" -mindepth 2 -maxdepth 2 -iname SKILL.md -print0 2>/dev/null \
+        | xargs -0 -r awk '
+            FNR==1 { infm=0; started=0; indesc=0; c=0
+                     nm=FILENAME; sub(/\/[Ss][Kk][Ii][Ll][Ll]\.md$/,"",nm); sub(/.*\//,"",nm) }
+            /^---[[:space:]]*$/ {
+              if (!started) { started=1; infm=1; next }
+              else if (infm) { infm=0; print c, nm; next }
+            }
+            !infm { next }
+            /^description:/ { s=$0; sub(/^description:[[:space:]]*/,"",s); c+=length(s); indesc=1; next }
+            /^[[:space:]]/  { if (indesc) c+=length($0); next }
+                            { indesc=0 }
+          ' 2>/dev/null \
+        | sort -rn | head -n "$top" \
+        | awk '{printf "  %5d tok  %s\n", int($1/4), $2}'
+      ;;
+
+    keep-used)
+      [ -d "$SKILLS_DIR" ] || die "no skills directory at $SKILLS_DIR"
+      local keepset tmp_keep total=0 kept=0 moved=0 name
+      keepset=$(build_keepset "$keep_extra" "$strict")
+      tmp_keep=$(mktemp) || die "mktemp failed"
+      printf '%s\n' "$keepset" > "$tmp_keep"
+
+      local want installed_keep=0 missing=()
+      while IFS= read -r want; do
+        [ -z "$want" ] && continue
+        if [ -f "$SKILLS_DIR/$want/SKILL.md" ]; then
+          installed_keep=$((installed_keep + 1))
+          say "  ${G}+${N} $want"
+        else
+          missing+=("$want")
+        fi
+      done < "$tmp_keep"
+      if [ "$strict" -eq 1 ]; then
+        say "${B}Keeping${N} $installed_keep installed skill(s): keep-file + --keep ${DIM}(strict: usage history ignored)${N}"
+      else
+        say "${B}Keeping${N} $installed_keep installed skill(s): used + keep-file + --keep"
+      fi
+      [ "${#missing[@]}" -gt 0 ] && \
+        say "${DIM}  (${#missing[@]} keep entr(y/ies) not installed, ignored: ${missing[*]})${N}"
+      say ""
+
+      local to_move=()
+      while IFS= read -r name; do
+        total=$((total + 1))
+        if grep -qxF "$name" "$tmp_keep" 2>/dev/null; then
+          kept=$((kept + 1))
+        else
+          to_move+=("$name")
+        fi
+      done < <(find "$SKILLS_DIR" -mindepth 2 -maxdepth 2 -iname SKILL.md 2>/dev/null \
+                 | sed -e "s|^$SKILLS_DIR/||" -e 's|/[Ss][Kk][Ii][Ll][Ll]\.md$||' | sort)
+      rm -f "$tmp_keep"
+
+      [ "${#to_move[@]}" -eq 0 ] && { say "${G}Nothing to deactivate.${N}"; return 0; }
+
+      local fm nc dc before after
+      fm=$(skill_frontmatter_chars "$SKILLS_DIR"); nc=${fm%% *}; dc=${fm##* }
+      before=$(est_tokens "$((nc + dc))")
+
+      say "Would deactivate ${B}${#to_move[@]}${N} of $total skills (keeping $kept)."
+      say "${DIM}They move to $DISABLED_DIR — nothing is deleted.${N}"
+      say ""
+
+      if [ "$DRY_RUN" -eq 1 ]; then
+        printf '%s\n' "${to_move[@]}" | head -n 12 | sed 's/^/  - /'
+        [ "${#to_move[@]}" -gt 12 ] && say "  ${DIM}... and $(( ${#to_move[@]} - 12 )) more${N}"
+        say ""
+        say "  ${DIM}[dry-run] nothing moved. Startup metadata would drop from ~${before}"
+        say "            tokens to roughly the ${#to_move[@]}-skill share you keep.${N}"
+        return 0
+      fi
+
+      confirm "Deactivate ${#to_move[@]} skills?" || { say "Aborted."; return 1; }
+
+      for name in "${to_move[@]}"; do
+        move_skill "$name" "$SKILLS_DIR" "$DISABLED_DIR" && moved=$((moved + 1))
+      done
+
+      fm=$(skill_frontmatter_chars "$SKILLS_DIR"); nc=${fm%% *}; dc=${fm##* }
+      after=$(est_tokens "$((nc + dc))")
+      say ""
+      say "${G}Deactivated $moved skills.${N}"
+      awk -v a="$before" -v b="$after" 'BEGIN{
+        printf "  startup metadata: ~%d -> ~%d tokens (saved ~%d, %.1f%% of a 200k window)\n",
+               a, b, a-b, ((a-b)/200000)*100 }'
+      say "${DIM}Restore anything with: claude-clean skills --enable <name>${N}"
+      ;;
+
+    match)
+      [ -n "$match" ] || die "--match needs a regex"
+      local hits=() name
+      while IFS= read -r name; do hits+=("$name"); done < <(
+        find "$SKILLS_DIR" -mindepth 2 -maxdepth 2 -iname SKILL.md 2>/dev/null \
+          | sed -e "s|^$SKILLS_DIR/||" -e 's|/[Ss][Kk][Ii][Ll][Ll]\.md$||' | grep -E "$match" | sort)
+      [ "${#hits[@]}" -eq 0 ] && { say "No active skills match /$match/."; return 0; }
+      say "${B}${#hits[@]}${N} skill(s) match /$match/:"
+      printf '  %s\n' "${hits[@]}"
+      [ "$DRY_RUN" -eq 0 ] && { confirm "Deactivate these?" || { say "Aborted."; return 1; }; }
+      for name in "${hits[@]}"; do move_skill "$name" "$SKILLS_DIR" "$DISABLED_DIR"; done
+      say "${G}Done.${N}"
+      ;;
+
+    disable)
+      [ "${#names[@]}" -gt 0 ] || die "--disable needs at least one skill name"
+      for name in "${names[@]}"; do
+        if move_skill "$name" "$SKILLS_DIR" "$DISABLED_DIR"; then
+          say "  ${Y}-${N} $name"
+        else
+          warn "not an active skill: $name"
+        fi
+      done
+      ;;
+
+    enable)
+      [ "${#names[@]}" -gt 0 ] || die "--enable needs at least one skill name"
+      for name in "${names[@]}"; do
+        if move_skill "$name" "$DISABLED_DIR" "$SKILLS_DIR"; then
+          say "  ${G}+${N} $name"
+        else
+          warn "not a deactivated skill: $name"
+        fi
+      done
+      ;;
+
+    enable-all)
+      [ -d "$DISABLED_DIR" ] || { say "Nothing deactivated."; return 0; }
+      local n; n=$(skill_count "$DISABLED_DIR")
+      [ "$n" -eq 0 ] && { say "Nothing deactivated."; return 0; }
+      [ "$DRY_RUN" -eq 0 ] && { confirm "Reactivate all $n skills?" || { say "Aborted."; return 1; }; }
+      local name
+      while IFS= read -r name; do move_skill "$name" "$DISABLED_DIR" "$SKILLS_DIR"; done < <(
+        find "$DISABLED_DIR" -mindepth 2 -maxdepth 2 -iname SKILL.md 2>/dev/null \
+          | sed -e "s|^$DISABLED_DIR/||" -e 's|/[Ss][Kk][Ii][Ll][Ll]\.md$||' | sort)
+      say "${G}Reactivated $n skills.${N}"
+      ;;
+  esac
+}
+
+# ----------------------------------------------------------------- cache ----
+
+cmd_cache() {
+  local keep_backups=3 snapshot_days=7
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep-backups)  keep_backups="${2:-3}"; shift ;;
+      --snapshot-days) snapshot_days="${2:-7}"; shift ;;
+      *) die "unknown option for 'cache': $1" ;;
+    esac
+    shift
+  done
+
+  local before after
+  before=$(( $(dir_bytes "$CLAUDE_HOME/telemetry") \
+            + $(dir_bytes "$CLAUDE_HOME/shell-snapshots") \
+            + $(dir_bytes "$CLAUDE_HOME/backups") ))
+
+  say "${B}Reclaiming cache${N} ${DIM}(no effect on context; disk only)${N}"
+  say "  current: $(human "$before")"
+  say ""
+
+  [ "$DRY_RUN" -eq 0 ] && { confirm "Purge telemetry, stale shell snapshots, and old config backups?" \
+      || { say "Aborted."; return 1; }; }
+
+  # Telemetry: failed-event spool. Safe to drop entirely.
+  if [ -d "$CLAUDE_HOME/telemetry" ]; then
+    local n; n=$(find "$CLAUDE_HOME/telemetry" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$n" -gt 0 ]; then
+      if [ "$DRY_RUN" -eq 1 ]; then
+        printf '%s  [dry-run] delete %s telemetry file(s)%s\n' "$DIM" "$n" "$N"
+      else
+        find "$CLAUDE_HOME/telemetry" -type f -delete 2>/dev/null
+        say "  ${G}✓${N} telemetry: removed $n file(s)"
+      fi
+    fi
+  fi
+
+  # Shell snapshots: regenerated per session.
+  if [ -d "$CLAUDE_HOME/shell-snapshots" ]; then
+    local n; n=$(find "$CLAUDE_HOME/shell-snapshots" -type f -mtime "+$snapshot_days" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$n" -gt 0 ]; then
+      if [ "$DRY_RUN" -eq 1 ]; then
+        printf '%s  [dry-run] delete %s shell snapshot(s) older than %sd%s\n' "$DIM" "$n" "$snapshot_days" "$N"
+      else
+        find "$CLAUDE_HOME/shell-snapshots" -type f -mtime "+$snapshot_days" -delete 2>/dev/null
+        say "  ${G}✓${N} shell-snapshots: removed $n file(s) older than ${snapshot_days}d"
+      fi
+    fi
+  fi
+
+  # Config backups: keep the N most recent.
+  if [ -d "$CLAUDE_HOME/backups" ]; then
+    local olds; olds=$(ls -1t "$CLAUDE_HOME/backups" 2>/dev/null | tail -n "+$((keep_backups + 1))")
+    if [ -n "$olds" ]; then
+      local n; n=$(printf '%s\n' "$olds" | grep -cv '^$')
+      if [ "$DRY_RUN" -eq 1 ]; then
+        printf '%s  [dry-run] delete %s old config backup(s), keeping %s%s\n' "$DIM" "$n" "$keep_backups" "$N"
+      else
+        printf '%s\n' "$olds" | while IFS= read -r f; do
+          [ -n "$f" ] && rm -rf "$CLAUDE_HOME/backups/$f"
+        done
+        say "  ${G}✓${N} backups: removed $n, kept $keep_backups most recent"
+      fi
+    fi
+  fi
+
+  # Stale IDE lockfiles from sessions that are gone.
+  if [ -d "$CLAUDE_HOME/ide" ]; then
+    local n; n=$(find "$CLAUDE_HOME/ide" -type f -name '*.lock' -mtime +1 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$n" -gt 0 ]; then
+      run find "$CLAUDE_HOME/ide" -type f -name '*.lock' -mtime +1 -delete
+      [ "$DRY_RUN" -eq 0 ] && say "  ${G}✓${N} ide: removed $n stale lock file(s)"
+    fi
+  fi
+
+  [ "$DRY_RUN" -eq 1 ] && return 0
+
+  after=$(( $(dir_bytes "$CLAUDE_HOME/telemetry") \
+           + $(dir_bytes "$CLAUDE_HOME/shell-snapshots") \
+           + $(dir_bytes "$CLAUDE_HOME/backups") ))
+  say ""
+  say "  reclaimed: ${B}$(human "$((before - after))")${N}"
+}
+
+# ------------------------------------------------------------ transcripts ----
+
+cmd_transcripts() {
+  local days=30
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --older-than) days="${2:-30}"; shift ;;
+      *) die "unknown option for 'transcripts': $1" ;;
+    esac
+    shift
+  done
+
+  local dir="$CLAUDE_HOME/projects"
+  [ -d "$dir" ] || { say "No transcripts directory."; return 0; }
+
+  local n bytes
+  n=$(find "$dir" -name '*.jsonl' -mtime "+$days" 2>/dev/null | wc -l | tr -d ' ')
+  say "${B}Session transcripts${N} ${DIM}(only loaded on --resume/--continue)${N}"
+  say "  total on disk: $(human "$(dir_bytes "$dir")")"
+  say "  older than ${days}d: $n file(s)"
+
+  [ "$n" -eq 0 ] && { say "${G}Nothing to prune.${N}"; return 0; }
+
+  bytes=$(find "$dir" -name '*.jsonl' -mtime "+$days" -print0 2>/dev/null \
+          | xargs -0 -r du -k 2>/dev/null | awk '{s+=$1} END{print s*1024+0}')
+  say "  would free: $(human "${bytes:-0}")"
+  say ""
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    find "$dir" -name '*.jsonl' -mtime "+$days" 2>/dev/null | sed "s|^$dir/|  [dry-run] rm |"
+    return 0
+  fi
+
+  confirm "Delete $n transcript(s) older than ${days}d? ${R}This is not reversible.${N}" \
+    || { say "Aborted."; return 1; }
+
+  find "$dir" -name '*.jsonl' -mtime "+$days" -delete 2>/dev/null
+  # Drop project dirs left empty afterwards.
+  find "$dir" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null
+  say "${G}✓${N} removed $n transcript(s), freed $(human "${bytes:-0}")"
+}
+
+# ---------------------------------------------------------------- config ----
+
+cmd_config() {
+  [ -f "$CLAUDE_CONFIG" ] || { say "No config at $CLAUDE_CONFIG"; return 0; }
+  command -v python3 >/dev/null 2>&1 || die "config compaction needs python3"
+
+  local before; before=$(wc -c <"$CLAUDE_CONFIG" | tr -d ' ')
+  say "${B}Compacting${N} $CLAUDE_CONFIG ${DIM}($(human "$before"))${N}"
+  say "${DIM}Removes regenerable cache keys only (cached*/​*Cache). Backed up first.${N}"
+
+  local preview
+  preview=$(python3 - "$CLAUDE_CONFIG" <<'PY'
+import json, re, sys
+d = json.load(open(sys.argv[1]))
+pat = re.compile(r'(^cached[A-Z])|(Cache$)|(CacheSlots$)')
+for k in sorted(d, key=lambda k: -len(json.dumps(d[k]))):
+    if pat.search(k):
+        print(f"  - {k} ({len(json.dumps(d[k]))} bytes)")
+PY
+) || die "could not parse $CLAUDE_CONFIG"
+
+  [ -z "$preview" ] && { say "${G}Nothing to compact.${N}"; return 0; }
+  say "$preview"
+  say ""
+
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  confirm "Strip these cache keys?" || { say "Aborted."; return 1; }
+
+  mkdir -p "$BACKUP_DIR"
+  local stamp; stamp=$(date +%Y%m%d-%H%M%S)
+  cp "$CLAUDE_CONFIG" "$BACKUP_DIR/claude.json.$stamp" || die "backup failed"
+
+  python3 - "$CLAUDE_CONFIG" <<'PY' || die "compaction failed; config untouched"
+import json, re, sys, os, tempfile
+p = sys.argv[1]
+d = json.load(open(p))
+pat = re.compile(r'(^cached[A-Z])|(Cache$)|(CacheSlots$)')
+for k in [k for k in d if pat.search(k)]:
+    del d[k]
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p))
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, p)
+PY
+
+  local after; after=$(wc -c <"$CLAUDE_CONFIG" | tr -d ' ')
+  say "${G}✓${N} $(human "$before") -> $(human "$after")"
+  say "${DIM}Backup: $BACKUP_DIR/claude.json.$stamp${N}"
+}
+
+# ------------------------------------------------------------------- all ----
+
+cmd_all() {
+  cmd_audit
+  head1 "── cache ──"
+  cmd_cache
+  head1 "── config ──"
+  cmd_config
+  say ""
+  say "${DIM}Skills and transcripts are not touched by 'all' — run them explicitly:${N}"
+  say "  ${C}claude-clean skills --keep-used${N}"
+  say "  ${C}claude-clean transcripts --older-than 30${N}"
+}
+
+# -------------------------------------------------------------- keepfile ----
+
+cmd_keep() {
+  case "${1:-show}" in
+    show)
+      if [ -f "$KEEP_FILE" ]; then
+        say "${B}$KEEP_FILE${N}"; cat "$KEEP_FILE"
+      else
+        say "No keep-file yet. Create one with: claude-clean keep init"
+      fi
+      ;;
+    init)
+      [ -f "$KEEP_FILE" ] && die "keep-file already exists: $KEEP_FILE"
+      { echo "# claude-clean keep-file"
+        echo "# One skill name per line. These are never deactivated by --keep-used."
+        echo "# Seeded from skills you have actually invoked."
+        echo
+        used_skills | sort -u
+      } > "$KEEP_FILE"
+      say "${G}✓${N} wrote $KEEP_FILE"
+      cat "$KEEP_FILE"
+      ;;
+    add)
+      shift
+      [ $# -gt 0 ] || die "keep add needs skill name(s)"
+      touch "$KEEP_FILE"
+      for s in "$@"; do
+        grep -qxF "$s" "$KEEP_FILE" 2>/dev/null || echo "$s" >> "$KEEP_FILE"
+        say "  ${G}+${N} $s"
+      done
+      ;;
+    *) die "usage: claude-clean keep [show|init|add <name>...]" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ help ----
+
+usage() {
+  cat <<'EOF'
+claude-clean — audit and slim down Claude Code's startup context
+
+USAGE
+  claude-clean <command> [options]
+
+COMMANDS
+  audit                       Measure startup context + disk usage  (default)
+  skills [opts]               Manage which skills load into context
+  cache [opts]                Purge telemetry, shell snapshots, old backups
+  transcripts [opts]          Prune old session transcripts (disk only)
+  config                      Strip regenerable cache keys from ~/.claude.json
+  keep [show|init|add ...]    Manage the never-deactivate skill list
+  all                         audit + cache + config
+  version                     Print version
+
+SKILLS OPTIONS
+  --list                      Show active and deactivated skills
+  --top [N]                   Rank active skills by description token cost
+  --keep-used                 Deactivate every skill you have never invoked
+  --keep a,b,c                Extra names to preserve alongside --keep-used
+  --strict                    With --keep-used, honor only the keep-file/--keep
+                              list; do not auto-preserve invoked skills
+  --match REGEX               Deactivate active skills matching a regex
+  --disable <name>...         Deactivate specific skills
+  --enable  <name>...         Reactivate specific skills
+  --enable-all                Reactivate everything
+
+CACHE OPTIONS
+  --keep-backups N            Config backups to retain (default 3)
+  --snapshot-days N           Delete shell snapshots older than N days (default 7)
+
+TRANSCRIPTS OPTIONS
+  --older-than N              Delete transcripts older than N days (default 30)
+
+GLOBAL FLAGS
+  -n, --dry-run               Show what would happen, change nothing
+  -y, --yes                   Skip confirmation prompts
+  -q, --quiet                 Suppress informational output
+  -h, --help                  This help
+
+NOTES
+  Deactivating a skill MOVES it to ~/.claude/skills.disabled — never deletes it.
+  Restart Claude Code for skill changes to take effect.
+  Transcript pruning IS destructive and is never included in 'all'.
+
+ENVIRONMENT
+  CLAUDE_HOME     default ~/.claude
+  CLAUDE_CONFIG   default ~/.claude.json
+  NO_COLOR        disable colored output
+
+EXAMPLES
+  claude-clean                                  # audit
+  claude-clean skills --top 30                  # find the heaviest skills
+  claude-clean skills --keep-used --dry-run     # preview the big win
+  claude-clean keep init && claude-clean skills --keep-used
+  claude-clean cache -y
+  claude-clean transcripts --older-than 60
+EOF
+}
+
+# ------------------------------------------------------------------ main ----
+
+main() {
+  local args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--dry-run) DRY_RUN=1 ;;
+      -y|--yes)     ASSUME_YES=1 ;;
+      -q|--quiet)   QUIET=1 ;;
+      -h|--help)    usage; exit 0 ;;
+      -v|--version) echo "claude-clean $VERSION"; exit 0 ;;
+      *)            args+=("$1") ;;
+    esac
+    shift
+  done
+  set -- "${args[@]+"${args[@]}"}"
+
+  [ -d "$CLAUDE_HOME" ] || die "no Claude Code directory at $CLAUDE_HOME (set CLAUDE_HOME to override)"
+
+  local cmd="${1:-audit}"
+  [ $# -gt 0 ] && shift
+
+  case "$cmd" in
+    audit|doctor|status) cmd_audit "$@" ;;
+    skills)              cmd_skills "$@" ;;
+    cache)               cmd_cache "$@" ;;
+    transcripts)         cmd_transcripts "$@" ;;
+    config)              cmd_config "$@" ;;
+    keep)                cmd_keep "$@" ;;
+    all)                 cmd_all "$@" ;;
+    version)             echo "claude-clean $VERSION" ;;
+    help)                usage ;;
+    *)                   err "unknown command: $cmd"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
