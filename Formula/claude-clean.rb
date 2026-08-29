@@ -6,7 +6,7 @@ class ClaudeClean < Formula
   desc "Audit and slim down Claude Code's startup context and on-disk state"
   homepage "https://github.com/HarsimarSingh23/claude-clean"
   url "https://github.com/HarsimarSingh23/claude-clean/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "0cc81ed0809ec21e419ddbe94e1d74d4fb86bb8c80de3cbfbec4acea9beb0d5e"
   license "MIT"
   head "https://github.com/HarsimarSingh23/claude-clean.git", branch: "main"
 
